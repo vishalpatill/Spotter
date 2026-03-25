@@ -1,0 +1,21 @@
+# Python / env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# env files
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# data / media
+*.sqlite3
+/media/
+uploads/
