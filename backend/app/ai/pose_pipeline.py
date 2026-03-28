@@ -6,8 +6,11 @@ import os
 from mediapipe import Image, ImageFormat
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from backend.app.ai.exercise_engine.engine import ExerciseEngine
+from backend.app.ai.exercise_engine.loader import load_exercises
+from backend.app.ai.pose.mediapipe_engine import detect_pose
 
-
+EXERCISE_ENGINE = None
 # Load MediaPipe Pose model once (production-safe)
 
 MODEL_PATH = os.path.join(
@@ -22,6 +25,9 @@ PoseLandmarker = vision.PoseLandmarker
 PoseLandmarkerOptions = vision.PoseLandmarkerOptions
 VisionRunningMode = vision.RunningMode
 
+def load_exercise_engine():
+    exercises = load_exercises("app/ai/exercise_engine/definitions")
+    return ExerciseEngine(exercises)
 
 def load_pose_landmarker():
     options = PoseLandmarkerOptions(
@@ -71,7 +77,22 @@ def run_blazepose_on_image(image_bytes: bytes) -> Optional[Dict]:
             "visibility": float(lm.visibility),
         })
 
-    return {"landmarks": landmarks, "image_shape": (h, w)}
+    global EXERCISE_ENGINE
+
+    if EXERCISE_ENGINE is None:
+        EXERCISE_ENGINE = load_exercise_engine()
+        EXERCISE_ENGINE.set_exercise("squat") 
+
+    angles = compute_relevant_angles(landmarks)
+
+    result = EXERCISE_ENGINE.process_frame(angles)
+
+    return {
+        "landmarks": landmarks,
+        "angles": angles,
+        "exercise_result": result,
+        "image_shape": (h, w)
+    }
 
 def angle_between(p1, p2, p3):
     x1, y1 = p1

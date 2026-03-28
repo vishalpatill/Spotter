@@ -1,35 +1,37 @@
 """
-Spotter Backend - Hybrid Version
+Spotter Backend - Unified Main API
 
-This version keeps your old /predict/ endpoint while adding new Learn Mode endpoints.
-Use this to test the new system without breaking your existing setup.
+This integrates:
+- yakup's YAML exercise definitions (from exercise_engine)
+- Your scoring system (from pose/)
+- Your FastAPI endpoints
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import time
+import yaml
+import os
 
-# Your existing imports
+# Your pose detection (original)
 from app.ai.pose_pipeline import run_blazepose_on_image, compute_relevant_angles
-from app.ai.movement_logic import detect_exercise_from_angles, posture_state_from_angles, detect_danger
-from app.services.session_service import get_session, remove_old_sessions
 
-# New imports
-from app.ai.exercise_library import get_exercise, detect_exercise_from_pose, get_all_exercises
-from app.ai.biomechanics_engine import BiomechanicsEngine
-from app.ai.scoring_engine import ScoringEngine
+# Your scoring & rep counting (what we built)
+from app.ai.scoring_engine import ScoringEngine, FrameScore
 from app.ai.rep_counter import RepCounter
 
+# yakup's exercise loader
+from app.ai.exercise_engine.loader import ExerciseLoader
 
 # ============================================================================
 # FastAPI App Setup
 # ============================================================================
 
 app = FastAPI(
-    title="Spotter Backend - Hybrid",
-    description="Old /predict/ endpoint + New Learn Mode endpoints",
-    version="2.0.0-hybrid"
+    title="Spotter - Ultimate Hybrid",
+    description="YAML exercises + Advanced scoring + FastAPI",
+    version="3.0.0-hybrid"
 )
 
 app.add_middleware(
@@ -40,32 +42,105 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================================================================
+# Load Exercises from YAML
+# ============================================================================
+
+class YAMLExerciseManager:
+    """Load and manage exercises from YAML files"""
+    
+    def __init__(self, definitions_dir: str = "app/ai/exercise_engine/definitions"):
+        self.definitions_dir = definitions_dir
+        self.exercises = {}
+        self.load_all()
+    
+    def load_all(self):
+        """Load all YAML exercise files"""
+        
+        if not os.path.exists(self.definitions_dir):
+            print(f"⚠️ Warning: {self.definitions_dir} not found")
+            return
+        
+        for filename in os.listdir(self.definitions_dir):
+            if filename.endswith('.yaml'):
+                exercise_id = filename.replace('.yaml', '')
+                filepath = os.path.join(self.definitions_dir, filename)
+                
+                try:
+                    with open(filepath, 'r') as f:
+                        exercise_data = yaml.safe_load(f)
+                        self.exercises[exercise_id] = exercise_data
+                        print(f"✅ Loaded exercise: {exercise_id}")
+                except Exception as e:
+                    print(f"❌ Failed to load {filename}: {e}")
+    
+    def get_exercise(self, exercise_id: str) -> Optional[Dict]:
+        """Get exercise definition"""
+        return self.exercises.get(exercise_id)
+    
+    def list_all(self) -> List[Dict]:
+        """List all available exercises"""
+        return [
+            {
+                "id": ex_id,
+                "name": ex_data.get('name', ex_id),
+                "display_name": ex_data.get('display_name', ex_id.title()),
+            }
+            for ex_id, ex_data in self.exercises.items()
+        ]
+    
+    def get_thresholds(self, exercise_id: str) -> tuple:
+        """Get rep detection thresholds for exercise"""
+        exercise = self.get_exercise(exercise_id)
+        if not exercise:
+            return (90.0, 150.0)  # Default
+        
+        # Parse from YAML
+        # yakup's format: angles → knee → down_threshold, up_threshold
+        angles = exercise.get('angles', {})
+        primary_joint = exercise.get('primary_joint', 'knee')
+        
+        joint_config = angles.get(primary_joint, {})
+        down_thresh = joint_config.get('down_threshold', 90.0)
+        up_thresh = joint_config.get('up_threshold', 150.0)
+        
+        return (down_thresh, up_thresh)
+
+
+# Global exercise manager
+exercise_manager = YAMLExerciseManager()
 
 # ============================================================================
-# Session Manager for NEW endpoints
+# Session Manager
 # ============================================================================
 
 class SessionManager:
-    """Manages Learn Mode sessions"""
+    """Manages workout sessions"""
     
     def __init__(self):
         self.sessions = {}
-        self.biomech_engine = BiomechanicsEngine()
+        self.scoring_engine = ScoringEngine()
     
-    def create_session(self, session_id: str, exercise_type: str, mode: str = "learn"):
+    def create_session(self, session_id: str, exercise_type: str):
         """Create new session"""
+        
+        # Get thresholds from YAML
+        exercise_def = exercise_manager.get_exercise(exercise_type)
+        if not exercise_def:
+            raise ValueError(f"Exercise '{exercise_type}' not found")
+        
         self.sessions[session_id] = {
             "session_id": session_id,
             "exercise_type": exercise_type,
-            "mode": mode,
+            "exercise_def": exercise_def,
             "rep_counter": RepCounter(exercise_type),
-            "scoring_engine": ScoringEngine(),
             "started_at": time.time(),
             "frame_count": 0,
             "rep_scores": [],
             "current_rep_frames": [],
             "status": "active"
         }
+        
         return self.sessions[session_id]
     
     def get_session(self, session_id: str) -> Optional[Dict]:
@@ -81,138 +156,49 @@ class SessionManager:
 
 session_manager = SessionManager()
 
-
 # ============================================================================
-# OLD ENDPOINT (Your Original Code - UNCHANGED)
-# ============================================================================
-
-@app.post("/predict/")
-async def predict(
-    file: UploadFile = File(...),
-    session_id: Optional[str] = Form(None),
-    user_id: Optional[str] = Form(None),
-):
-    """
-    OLD ENDPOINT - Your original code
-    
-    This is kept for backward compatibility.
-    For new features, use /api/learn-mode/* endpoints instead.
-    """
-    
-    contents = await file.read()
-    result = run_blazepose_on_image(contents)
-    
-    if result is None:
-        return {"ok": False, "msg": "no-person-detected"}
-    
-    landmarks = result["landmarks"]
-    angles = compute_relevant_angles(landmarks)
-    exercise = detect_exercise_from_angles(angles)
-    posture_state = posture_state_from_angles(angles)
-    danger_alerts = detect_danger(landmarks, angles)
-    
-    if not session_id:
-        session_id = f"anon-{int(time.time() * 1000)}"
-    
-    session = get_session(session_id)
-    adaptive_feedback = None
-    rep_completed = False
-    
-    if session.get("last_exercise") != exercise:
-        session["state"] = "up"
-        session["last_exercise"] = exercise
-    
-    try:
-        if exercise in ("squat", "pushup"):
-            if exercise == "squat":
-                lk = angles.get("left_knee")
-                rk = angles.get("right_knee")
-                angle_val = (lk + rk) / 2.0 if (lk is not None and rk is not None) else None
-                down_thresh, up_thresh = 90.0, 150.0
-            else:
-                le = angles.get("left_elbow")
-                re = angles.get("right_elbow")
-                angle_val = (le + re) / 2.0 if (le is not None and re is not None) else None
-                down_thresh, up_thresh = 70.0, 150.0
-            
-            if angle_val is not None:
-                if session["state"] == "up" and angle_val < down_thresh:
-                    session["state"] = "down"
-                elif session["state"] == "down" and angle_val > up_thresh:
-                    session["reps"] += 1
-                    rep_completed = True
-                    session["state"] = "up"
-                    session["bad_count"] = 0
-    except Exception:
-        pass
-    
-    if posture_state == "bad" or len(danger_alerts) > 0:
-        session["bad_count"] += 1
-    else:
-        session["bad_count"] = 0
-    
-    if session["bad_count"] >= 3:
-        adaptive_feedback = "You keep repeating a posture mistake. Slow down and focus on alignment."
-        session["bad_count"] = 0
-    
-    session["history"].append({
-        "ts": time.time(),
-        "angles": angles,
-        "exercise": exercise,
-        "posture_state": posture_state,
-        "danger_alerts": danger_alerts,
-        "rep_completed": rep_completed
-    })
-    
-    remove_old_sessions()
-    
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "angles": angles,
-        "exercise": exercise,
-        "posture_state": posture_state,
-        "danger_alerts": danger_alerts,
-        "adaptive_feedback": adaptive_feedback,
-        "rep_completed": rep_completed,
-        "reps_total": session.get("reps", 0),
-        "landmark_count": len(landmarks),
-    }
-
-
-# ============================================================================
-# NEW ENDPOINTS (Learn Mode with Advanced Features)
+# API Endpoints
 # ============================================================================
 
 @app.get("/")
 def health_check():
-    """Health check endpoint"""
+    """Health check"""
     return {
         "status": "online",
-        "version": "2.0.0-hybrid",
-        "service": "Spotter Backend",
-        "endpoints": {
-            "old": "/predict/",
-            "new": ["/api/learn-mode/start", "/api/learn-mode/frame", "/api/learn-mode/finish"]
-        }
+        "version": "3.0.0-hybrid",
+        "service": "Spotter Ultimate",
+        "exercises_loaded": len(exercise_manager.exercises),
+        "features": [
+            "YAML exercise definitions",
+            "Advanced AI scoring",
+            "Real-time form feedback",
+            "Rep counting with FSM"
+        ]
     }
 
 
 @app.get("/api/exercises/")
 def list_exercises():
-    """Get all supported exercises"""
-    exercises = get_all_exercises()
+    """Get all exercises from YAML files"""
+    exercises = exercise_manager.list_all()
     return {
         "total": len(exercises),
-        "exercises": [
-            {
-                "id": ex.id,
-                "name": ex.display_name,
-                "category": ex.category.value,
-                "difficulty": ex.difficulty.value
-            }
-            for ex in exercises
-        ]
+        "exercises": exercises,
+        "source": "YAML files from yakup's repo"
+    }
+
+
+@app.get("/api/exercises/{exercise_id}")
+def get_exercise_details(exercise_id: str):
+    """Get detailed exercise definition"""
+    exercise = exercise_manager.get_exercise(exercise_id)
+    
+    if not exercise:
+        raise HTTPException(status_code=404, detail=f"Exercise '{exercise_id}' not found")
+    
+    return {
+        "id": exercise_id,
+        "definition": exercise
     }
 
 
@@ -221,66 +207,48 @@ async def start_learn_mode(
     user_id: str = Form(...),
     exercise_type: str = Form(...),
 ):
-    """
-    NEW ENDPOINT - Start a Learn Mode session
+    """Start Learn Mode session with YAML exercise"""
     
-    Learn Mode provides:
-    - Real-time form scoring (0-100)
-    - Component scores (depth, symmetry, stability, tempo, alignment)
-    - Better rep counting
-    - Coaching tips
-    """
-    
-    # Validate exercise
-    exercise_def = get_exercise(exercise_type)
+    # Validate exercise exists
+    exercise_def = exercise_manager.get_exercise(exercise_type)
     if not exercise_def:
+        available = [ex['id'] for ex in exercise_manager.list_all()]
         raise HTTPException(
             status_code=400,
-            detail=f"Exercise '{exercise_type}' not supported. Use /api/exercises/ to see available exercises."
+            detail=f"Exercise '{exercise_type}' not found. Available: {available}"
         )
     
     # Create session
     session_id = f"{user_id}_{int(time.time() * 1000)}"
-    session = session_manager.create_session(session_id, exercise_type, mode="learn")
+    session = session_manager.create_session(session_id, exercise_type)
     
     return {
         "ok": True,
         "session_id": session_id,
         "exercise_type": exercise_type,
+        "exercise_name": exercise_def.get('display_name', exercise_type),
         "mode": "learn",
-        "message": f"Learn Mode started for {exercise_def.display_name}",
-        "tips": exercise_def.tips
+        "message": f"Learn Mode started for {exercise_def.get('display_name', exercise_type)}",
+        "tips": exercise_def.get('tips', [])
     }
 
 
 @app.post("/api/learn-mode/frame")
-async def process_learn_mode_frame(
+async def process_frame(
     session_id: str = Form(...),
     file: UploadFile = File(...),
 ):
-    """
-    NEW ENDPOINT - Process a single frame in Learn Mode
-    
-    Returns comprehensive analysis:
-    - Form score (0-100)
-    - Component scores
-    - Rep count
-    - Danger alerts
-    - Coaching tips
-    """
+    """Process frame with YAML + Scoring hybrid"""
     
     # Get session
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    if session["status"] != "active":
-        raise HTTPException(status_code=400, detail="Session is not active")
-    
     # Read image
     contents = await file.read()
     
-    # 1. Pose Detection
+    # 1. Pose Detection (your code)
     pose_result = run_blazepose_on_image(contents)
     if pose_result is None:
         return {
@@ -291,37 +259,39 @@ async def process_learn_mode_frame(
     
     landmarks = pose_result["landmarks"]
     
-    # 2. Calculate angles
+    # 2. Calculate angles (your code)
     angles = compute_relevant_angles(landmarks)
     
-    # 3. Auto-detect exercise
-    detected_exercise = detect_exercise_from_pose(angles, landmarks)
+    # 3. Simple biomechanics (for now)
+    # In future, integrate yakup's angle_calculator if needed
+    danger_alerts = []
     
-    # 4. Biomechanics Analysis (NEW)
-    biomech_engine = session_manager.biomech_engine
-    biomechanics = biomech_engine.analyze(landmarks, session["exercise_type"])
+    # Basic danger check (simplified)
+    left_knee = angles.get("left_knee", 180)
+    right_knee = angles.get("right_knee", 180)
     
-    # 5. Scoring (NEW)
-    scoring_engine = session["scoring_engine"]
-    frame_score = scoring_engine.score_frame(
+    if abs(left_knee - right_knee) > 20:
+        danger_alerts.append("asymmetric_movement")
+    
+    # 4. Scoring (YOUR advanced system - yakup doesn't have this!)
+    frame_score = session_manager.scoring_engine.score_frame(
         {
             "angles": angles,
-            "symmetry_score": biomechanics.symmetry_score,
-            "balance_score": biomechanics.balance_score,
-            "spine_alignment": biomechanics.spine_alignment,
+            "symmetry_score": 100 - abs(left_knee - right_knee),
+            "balance_score": 85.0,  # Simplified
+            "spine_alignment": 25.0,
         },
         session["exercise_type"]
     )
     
-    # 6. Rep Counting (NEW)
+    # 5. Rep Counting (your code)
     rep_counter = session["rep_counter"]
     rep_event = rep_counter.update(angles)
     
-    # Store frame data
+    # Track frame
     session["current_rep_frames"].append({
         "timestamp": time.time(),
         "frame_score": frame_score,
-        "biomechanics": biomechanics,
         "angles": angles
     })
     
@@ -333,13 +303,13 @@ async def process_learn_mode_frame(
     if rep_event:
         rep_completed = True
         
-        # Score the completed rep
+        # Score the rep
         frame_scores = [f["frame_score"] for f in session["current_rep_frames"]]
-        rep_score_obj = scoring_engine.score_rep(
+        rep_score_obj = session_manager.scoring_engine.score_rep(
             frame_scores=frame_scores,
             rep_number=rep_event.rep_number,
             rep_duration_sec=rep_event.duration_sec,
-            danger_alerts=biomechanics.danger_alerts,
+            danger_alerts=danger_alerts,
             exercise_type=session["exercise_type"]
         )
         
@@ -349,11 +319,6 @@ async def process_learn_mode_frame(
         rep_score = {
             "rep_number": rep_score_obj.rep_number,
             "form_score": round(rep_score_obj.form_score, 1),
-            "depth_score": round(rep_score_obj.depth_score, 1),
-            "symmetry_score": round(rep_score_obj.symmetry_score, 1),
-            "stability_score": round(rep_score_obj.stability_score, 1),
-            "tempo_score": round(rep_score_obj.tempo_score, 1),
-            "alignment_score": round(rep_score_obj.alignment_score, 1),
             "grade": rep_score_obj.grade,
             "duration_sec": round(rep_score_obj.rep_duration_sec, 2)
         }
@@ -362,16 +327,18 @@ async def process_learn_mode_frame(
     
     session["frame_count"] += 1
     
-    # Response
+    # Get coaching cues from YAML
+    exercise_def = session["exercise_def"]
+    available_tips = exercise_def.get('tips', [])
+    
     return {
         "ok": True,
         "session_id": session_id,
         
         # Exercise info
-        "exercise_detected": detected_exercise,
-        "exercise_expected": session["exercise_type"],
+        "exercise_type": session["exercise_type"],
         
-        # Real-time scores (NEW)
+        # Real-time scores (YOUR ADVANCED SYSTEM!)
         "form_score": round(frame_score.form_score, 1),
         "depth_score": round(frame_score.depth_score, 1),
         "symmetry_score": round(frame_score.symmetry_score, 1),
@@ -384,35 +351,29 @@ async def process_learn_mode_frame(
         "rep_score": rep_score,
         
         # Safety
-        "danger_alerts": biomechanics.danger_alerts,
-        "danger_severity": biomechanics.danger_severity,
+        "danger_alerts": danger_alerts,
         
-        # Coaching (NEW)
-        "coaching_tip": coaching_tip,
+        # Coaching
+        "coaching_tip": coaching_tip if coaching_tip else (available_tips[0] if available_tips else None),
         
-        # Debug info
+        # Debug
         "angles": {k: round(v, 1) for k, v in angles.items()},
+        "source": "YAML exercise + YOUR scoring system"
     }
 
 
 @app.post("/api/learn-mode/finish")
-async def finish_learn_mode(
+async def finish_session(
     session_id: str = Form(...),
 ):
-    """
-    NEW ENDPOINT - Finish a Learn Mode session
-    
-    Returns session summary with grades and analytics
-    """
+    """Finish session and get summary"""
     
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    # End session
     session_manager.end_session(session_id)
     
-    # Calculate session stats
     rep_scores = session["rep_scores"]
     
     if not rep_scores:
@@ -423,50 +384,35 @@ async def finish_learn_mode(
             "message": "No reps completed"
         }
     
+    # Calculate stats
     form_scores = [r.form_score for r in rep_scores]
-    
     avg_form = sum(form_scores) / len(form_scores)
-    best_rep = max(form_scores)
-    worst_rep = min(form_scores)
     
-    # Calculate grade
+    # Grade
     if avg_form >= 90:
         grade = "A"
-        summary = "Excellent session! Your form was outstanding."
+        summary = "Excellent session!"
     elif avg_form >= 80:
         grade = "B"
-        summary = "Great session! Strong form overall."
-    elif avg_form >= 70:
-        grade = "C"
-        summary = "Good session. Work on consistency."
+        summary = "Great session!"
     else:
-        grade = "D"
-        summary = "Session complete. Focus on form fundamentals."
+        grade = "C"
+        summary = "Good effort!"
     
     return {
         "ok": True,
         "session_id": session_id,
         "exercise_type": session["exercise_type"],
-        "mode": session["mode"],
-        
-        # Session stats
         "total_reps": len(rep_scores),
         "avg_form_score": round(avg_form, 1),
-        "best_rep_score": round(best_rep, 1),
-        "worst_rep_score": round(worst_rep, 1),
         "grade": grade,
         "summary": summary,
-        
-        # Duration
         "duration_sec": round(time.time() - session["started_at"], 1),
-        
-        # Per-rep breakdown
         "reps": [
             {
                 "rep": r.rep_number,
                 "score": round(r.form_score, 1),
-                "grade": r.grade,
-                "tip": r.coaching_tip
+                "grade": r.grade
             }
             for r in rep_scores
         ]
