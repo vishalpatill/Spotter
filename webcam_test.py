@@ -1,10 +1,10 @@
 import cv2
 from backend.app.ai.pose.mediapipe_engine import detect_pose
 import math
-import time 
-import mediapipe as mp
+import time
 
 print("🚀 Starting Spotter AI...")
+
 
 def draw_skeleton(frame, landmarks):
     connections = [
@@ -28,6 +28,16 @@ def draw_skeleton(frame, landmarks):
             x1, y1 = landmarks[a]
             x2, y2 = landmarks[b]
             cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
+
+
+def calculate_angle(a, b, c):
+    angle = math.degrees(
+        math.atan2(c[1] - b[1], c[0] - b[0]) -
+        math.atan2(a[1] - b[1], a[0] - b[0])
+    )
+    return abs(angle)
+
+
 def main():
     cap = cv2.VideoCapture(0)
 
@@ -38,10 +48,14 @@ def main():
     print("✅ Webcam running. Press 'q' to quit.")
 
     counter = 0
-    stage = None
-    last_count_time = 0
+    stage = "up"
     down_start_time = None
-    angle_buffer = []   
+    angle_buffer = []
+
+    # 🔥 NEW THRESHOLDS (tunable later)
+    DOWN_ANGLE = 100
+    UP_ANGLE = 160
+    MIN_DOWN_TIME = 0.4  # seconds
 
     while True:
         ret, frame = cap.read()
@@ -52,15 +66,6 @@ def main():
 
         if landmarks:
             draw_skeleton(frame, landmarks)
-
-        if landmarks:
-            # angle function FIRST (fix order)
-            def calculate_angle(a, b, c):
-                angle = math.degrees(
-                    math.atan2(c[1] - b[1], c[0] - b[0]) -
-                    math.atan2(a[1] - b[1], a[0] - b[0])
-                )
-                return abs(angle)
 
             # get key points
             hip_l = landmarks["LEFT_HIP"]
@@ -75,7 +80,7 @@ def main():
             angle_l = calculate_angle(hip_l, knee_l, ankle_l)
             angle_r = calculate_angle(hip_r, knee_r, ankle_r)
 
-            # average
+            # average angle
             raw_angle = (angle_l + angle_r) / 2
 
             # smoothing
@@ -85,24 +90,21 @@ def main():
 
             knee_angle = sum(angle_buffer) / len(angle_buffer)
 
-            print("KNEE:", knee_angle)
+            print("KNEE:", int(knee_angle))
 
-            # squat logic
-            if knee_angle < 95:
-                if down_start_time is None:
+            # 🔥 IMPROVED SQUAT LOGIC
+            if knee_angle < DOWN_ANGLE:
+                if stage != "down":
+                    stage = "down"
                     down_start_time = time.time()
 
-                if time.time() - down_start_time > 0.5:
-                    stage = "down"
-
-            elif knee_angle > 160:
-                down_start_time = None
-
+            elif knee_angle > UP_ANGLE:
                 if stage == "down":
-                    if time.time() - last_count_time > 1:
-                        stage = "up"
+                    # ensure proper squat depth duration
+                    if down_start_time and (time.time() - down_start_time > MIN_DOWN_TIME):
                         counter += 1
-                        last_count_time = time.time()
+                        stage = "up"
+                        down_start_time = None
 
             # display
             cv2.putText(frame, f"Reps: {counter}", (10, 30),
@@ -110,6 +112,9 @@ def main():
 
             cv2.putText(frame, f"Angle: {int(knee_angle)}", (10, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+
+            cv2.putText(frame, f"Stage: {stage}", (10, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
 
         cv2.imshow("Spotter AI", frame)
 

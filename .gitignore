@@ -1,21 +1,17 @@
-# Python / env
-venv/
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
 
-# env files
-.env
+# Virtual env
+venv/
 
-# IDE
-.vscode/
-.idea/
+# Data (very important)
+data/
 
 # OS
 .DS_Store
+Thumbs.db
 
-# data / media
-*.sqlite3
-/media/
-uploads/
+# VS Code
+.vscode/
