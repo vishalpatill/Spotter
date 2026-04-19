@@ -1,7 +1,6 @@
 import cv2
-import numpy as np
-import time
 import os
+import time
 from mediapipe import Image, ImageFormat
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -20,13 +19,16 @@ VisionRunningMode = vision.RunningMode
 POSE_LANDMARKER = None
 
 
+# --------------------------
+# LOAD MODEL (VIDEO MODE ✅)
+# --------------------------
 def load_model():
     global POSE_LANDMARKER
 
     if POSE_LANDMARKER is None:
         options = PoseLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=MODEL_PATH),
-            running_mode=VisionRunningMode.VIDEO,
+            running_mode=VisionRunningMode.VIDEO,   # ✅ FIXED BACK
             num_poses=1,
         )
         POSE_LANDMARKER = PoseLandmarker.create_from_options(options)
@@ -34,7 +36,9 @@ def load_model():
     return POSE_LANDMARKER
 
 
-
+# --------------------------
+# DETECT POSE (TRACKING ENABLED)
+# --------------------------
 def detect_pose(frame):
     model = load_model()
 
@@ -45,20 +49,17 @@ def detect_pose(frame):
         data=img_rgb
     )
 
-    import time
+    # ✅ REQUIRED for VIDEO mode
     timestamp_ms = int(time.time() * 1000)
 
     result = model.detect_for_video(mp_image, timestamp_ms)
 
     if not result.pose_landmarks:
-        print("❌ No pose detected")
         return None
-
-    print("✅ Pose detected")
 
     lm = result.pose_landmarks[0]
 
-    h, w, _ = frame.shape   # 👈 ADD THIS
+    h, w, _ = frame.shape
 
     landmark_dict = {
         "LEFT_HIP": (lm[23].x * w, lm[23].y * h),
