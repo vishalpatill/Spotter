@@ -1,0 +1,9 @@
+{
+  "total_sequences": 1654,
+  "sequence_length": 20,
+  "feature_count": 7,
+  "good_count": 940,
+  "bad_count": 714,
+  "window_size": 20,
+  "stride": 4
+}
