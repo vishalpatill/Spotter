@@ -1,0 +1,24 @@
+{
+  "good_videos": 19,
+  "bad_videos": 13,
+  "good_raw_seqs": 864,
+  "bad_raw_seqs": 637,
+  "train_samples": 8153,
+  "val_samples": 2039,
+  "seq_len": 20,
+  "feat_len": 7,
+  "features": [
+    "left_knee/180",
+    "right_knee/180",
+    "left_hip/180",
+    "right_hip/180",
+    "knee_diff/180",
+    "hip_diff/180",
+    "avg_knee/180"
+  ],
+  "label_map": {
+    "0": "BAD",
+    "1": "GOOD"
+  },
+  "camera_view": "side-only"
+}

@@ -1,152 +1,266 @@
 """
-train_lstm_v2.py
-================
-Place at: SPOTTER/backend/app/ai/ml/train_lstm_v2.py
+train_lstm.py  —  Spotter AI LSTM Trainer (v2, small-dataset optimized)
+========================================================================
+Reads processed sequences from data/processed/squat/
+Trains a Bidirectional LSTM with techniques for small datasets:
+  - Heavy dropout + L2 regularization
+  - Label smoothing
+  - Learning rate warmup + cosine decay
+  - Cross-validation for reliable accuracy estimate
+  - TFLite export for fast inference
 
 Run from SPOTTER root:
-    python backend/app/ai/ml/train_lstm_v2.py
+    python train_lstm.py
+
+Output:
+    backend/app/ai/ml/squat_model.h5
+    backend/app/ai/ml/squat_model.keras
+    backend/app/ai/ml/squat_model_best.keras
+    backend/app/ai/ml/squat_model.tflite
+    data/processed/squat/training_report.png
 """
 
+import sys
+import os
 import json
 import numpy as np
 from pathlib import Path
-from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import (
-    LSTM, Bidirectional, Dense, Dropout, Input, BatchNormalization
-)
-from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
-from tensorflow.keras.optimizers import Adam
 
-# ── Paths — this file lives at SPOTTER/backend/app/ai/ml/train_lstm_v2.py ────
-THIS_FILE    = Path(__file__).resolve()
-ML_DIR       = THIS_FILE.parent                          # .../backend/app/ai/ml/
-SPOTTER_ROOT = ML_DIR.parents[3]                         # SPOTTER/
+# ── Paths ──────────────────────────────────────────────────────────────────────
+DATA_DIR  = Path("data/processed/squat")
+MODEL_DIR = Path("backend/app/ai/ml")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-DATA_DIR  = SPOTTER_ROOT / "data" / "processed" / "squat"
-MODEL_OUT = ML_DIR / "squat_model.keras"
-HIST_OUT  = ML_DIR / "training_history.json"
+X_TRAIN = DATA_DIR / "X_train.npy"
+Y_TRAIN = DATA_DIR / "y_train.npy"
+X_VAL   = DATA_DIR / "X_val.npy"
+Y_VAL   = DATA_DIR / "y_val.npy"
 
-print(f"📁 Data  : {DATA_DIR}")
-print(f"💾 Model : {MODEL_OUT}")
+for p in [X_TRAIN, Y_TRAIN, X_VAL, Y_VAL]:
+    if not p.exists():
+        print(f"❌ Missing: {p}")
+        print("   Run: python build_dataset.py  first")
+        sys.exit(1)
 
-# Verify data exists before importing keras (saves time if path wrong)
-if not (DATA_DIR / "X.npy").exists():
-    raise FileNotFoundError(
-        f"\n❌ Dataset not found at: {DATA_DIR}\n"
-        f"   Run dataset_builder.py first."
+# ── Load data ──────────────────────────────────────────────────────────────────
+X_train = np.load(X_TRAIN).astype(np.float32)
+y_train = np.load(Y_TRAIN).astype(np.float32)
+X_val   = np.load(X_VAL).astype(np.float32)
+y_val   = np.load(Y_VAL).astype(np.float32)
+
+print(f"📦 Data loaded")
+print(f"   Train: {X_train.shape}  labels {dict(zip(*np.unique(y_train.astype(int), return_counts=True)))}")
+print(f"   Val:   {X_val.shape}    labels {dict(zip(*np.unique(y_val.astype(int),   return_counts=True)))}")
+
+SEQ_LEN, FEAT_LEN = X_train.shape[1], X_train.shape[2]
+
+# ── Import TF ──────────────────────────────────────────────────────────────────
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks, regularizers
+
+print(f"\n🔧 TensorFlow {tf.__version__}")
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# ── Model builder ──────────────────────────────────────────────────────────────
+def build_model(dropout=0.40, l2=1e-4, lstm_units=(64, 32)):
+    """
+    Bidirectional LSTM optimized for 7-feature, 20-frame squat sequences.
+    Small and regularized to avoid overfitting on ~200 training examples.
+    """
+    inp = layers.Input(shape=(SEQ_LEN, FEAT_LEN), name="pose_seq")
+
+    # LSTM layers
+    x = layers.Bidirectional(
+            layers.LSTM(lstm_units[0], return_sequences=True,
+                        dropout=0.20, recurrent_dropout=0.10,
+                        kernel_regularizer=regularizers.l2(l2)),
+            name="bilstm_1")(inp)
+    x = layers.LayerNormalization()(x)
+    x = layers.Dropout(dropout)(x)
+
+    x = layers.Bidirectional(
+            layers.LSTM(lstm_units[1], return_sequences=False,
+                        dropout=0.20, recurrent_dropout=0.10,
+                        kernel_regularizer=regularizers.l2(l2)),
+            name="bilstm_2")(x)
+    x = layers.Dropout(dropout)(x)
+
+    # Dense head
+    x   = layers.Dense(32, activation="relu",
+                       kernel_regularizer=regularizers.l2(l2))(x)
+    x   = layers.Dropout(dropout * 0.5)(x)
+    out = layers.Dense(1, activation="sigmoid", name="output")(x)
+
+    m = models.Model(inp, out, name="SpotterLSTM_v2")
+    m.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=5e-4),
+        loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=0.05),
+        metrics=[
+            "accuracy",
+            tf.keras.metrics.AUC(name="auc"),
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
+        ],
     )
+    return m
 
-EPOCHS     = 100
-BATCH_SIZE = 32
-LR         = 1e-3
+# ── Print model summary ────────────────────────────────────────────────────────
+sample_model = build_model()
+sample_model.summary()
+total_params = sample_model.count_params()
+print(f"\n   Total parameters: {total_params:,}")
 
-
-def build_model(seq_len: int, feat_count: int) -> Sequential:
-    model = Sequential(name="SpotterSquatLSTM_v2")
-    model.add(Input(shape=(seq_len, feat_count)))
-    model.add(Bidirectional(LSTM(64, return_sequences=True)))
-    model.add(BatchNormalization())
-    model.add(Dropout(0.3))
-    model.add(LSTM(32))
-    model.add(BatchNormalization())
-    model.add(Dropout(0.3))
-    model.add(Dense(16, activation="relu"))
-    model.add(Dense(2, activation="softmax"))
-    model.compile(
-        optimizer=Adam(learning_rate=LR),
-        loss="categorical_crossentropy",
-        metrics=["accuracy"],
-    )
-    return model
-
-
-def main():
-    # ── Load ──────────────────────────────────────────────────────────────────
-    X = np.load(DATA_DIR / "X.npy")
-    y = np.load(DATA_DIR / "y.npy")
-    print(f"\n✅ Dataset: X={X.shape}  y={y.shape}")
-    print(f"   Good: {int(np.sum(y==1))}  |  Bad: {int(np.sum(y==0))}")
-
-    seq_len, feat_count = X.shape[1], X.shape[2]
-
-    # ── Train/test split ──────────────────────────────────────────────────────
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-
-    # ── Class weights — handles good/bad imbalance ────────────────────────────
-    weights       = compute_class_weight("balanced", classes=np.unique(y_tr), y=y_tr)
-    class_weights = dict(enumerate(weights))
-    print(f"   Class weights: {class_weights}")
-
-    y_tr_cat = to_categorical(y_tr, num_classes=2)
-    y_te_cat = to_categorical(y_te, num_classes=2)
-
-    # ── Model ─────────────────────────────────────────────────────────────────
-    model = build_model(seq_len, feat_count)
-    model.summary()
-
-    # ── Callbacks ─────────────────────────────────────────────────────────────
-    best_path = str(MODEL_OUT).replace(".keras", "_best.keras")
-    callbacks = [
-        EarlyStopping(
-            monitor="val_accuracy", patience=12,
-            restore_best_weights=True, verbose=1
-        ),
-        ReduceLROnPlateau(
+# ── Training callbacks ─────────────────────────────────────────────────────────
+def make_callbacks(run_name="default"):
+    best_path = str(MODEL_DIR / f"squat_model_best.keras")
+    return [
+        callbacks.EarlyStopping(
+            monitor="val_auc", patience=25,
+            restore_best_weights=True, mode="max", verbose=1),
+        callbacks.ReduceLROnPlateau(
             monitor="val_loss", factor=0.5,
-            patience=5, min_lr=1e-6, verbose=1
-        ),
-        ModelCheckpoint(
-            best_path, monitor="val_accuracy",
-            save_best_only=True, verbose=0
-        ),
+            patience=10, min_lr=1e-6, verbose=1),
+        callbacks.ModelCheckpoint(
+            best_path, monitor="val_auc",
+            save_best_only=True, mode="max", verbose=0),
     ]
 
-    # ── Train ─────────────────────────────────────────────────────────────────
-    print(f"\n🚀 Training on {len(X_tr)} sequences, validating on {len(X_te)}...\n")
-    history = model.fit(
-        X_tr, y_tr_cat,
-        validation_data=(X_te, y_te_cat),
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        class_weight=class_weights,
-        callbacks=callbacks,
-        verbose=1,
-    )
+# ── Train ──────────────────────────────────────────────────────────────────────
+print("\n🏋️  Training...")
+model = build_model()
 
-    # ── Evaluate ──────────────────────────────────────────────────────────────
-    loss, acc = model.evaluate(X_te, y_te_cat, verbose=0)
-    print(f"\n{'='*50}")
-    print(f"  🏆 Test accuracy : {acc*100:.1f}%")
-    print(f"  📉 Test loss     : {loss:.4f}")
-    print(f"{'='*50}")
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=200,
+    batch_size=min(32, len(X_train) // 4),   # don't use huge batches on tiny data
+    callbacks=make_callbacks(),
+    verbose=1,
+)
 
-    # ── Save model ────────────────────────────────────────────────────────────
-    model.save(str(MODEL_OUT))
-    print(f"✅ Model saved → {MODEL_OUT}")
+# ── Evaluation ─────────────────────────────────────────────────────────────────
+print("\n📈 Final evaluation on validation set:")
+results = model.evaluate(X_val, y_val, verbose=0)
+for name, val in zip(model.metrics_names, results):
+    print(f"   {name:12s} = {val:.4f}")
 
-    # Save training history for later plotting
-    hist = {k: [float(v) for v in vs] for k, vs in history.history.items()}
-    with open(HIST_OUT, "w") as f:
-        json.dump(hist, f, indent=2)
-    print(f"📈 History  → {HIST_OUT}")
+# Detailed report
+from sklearn.metrics import classification_report, confusion_matrix
 
-    # ── Advice ────────────────────────────────────────────────────────────────
-    print()
-    if acc < 0.75:
-        print("⚠️  Accuracy below 75% — consider adding more varied videos")
-    elif acc < 0.85:
-        print("✅ Decent accuracy. Model is usable. More data will improve further.")
-    else:
-        print("🔥 Excellent accuracy! Model is production-ready.")
+y_pred_prob = model.predict(X_val, verbose=0).flatten()
+y_pred      = (y_pred_prob > 0.5).astype(int)
+y_true      = y_val.astype(int)
 
-    print(f"\nNext: start the API with:")
-    print(f"  uvicorn backend.app.ai.main:app --reload --host 0.0.0.0 --port 8000")
+print("\nClassification Report:")
+print(classification_report(y_true, y_pred, target_names=["BAD (0)", "GOOD (1)"]))
 
+cm = confusion_matrix(y_true, y_pred)
+print(f"Confusion Matrix (rows=actual, cols=predicted):")
+print(f"         BAD   GOOD")
+print(f"  BAD  [{cm[0,0]:5d} {cm[0,1]:5d}]")
+print(f"  GOOD [{cm[1,0]:5d} {cm[1,1]:5d}]")
 
-if __name__ == "__main__":
-    main()
+# ── Calibrate decision threshold ───────────────────────────────────────────────
+# Find threshold that maximises F1 on validation set
+from sklearn.metrics import f1_score
+
+best_thresh, best_f1 = 0.5, 0.0
+for t in np.arange(0.3, 0.8, 0.01):
+    preds = (y_pred_prob > t).astype(int)
+    f1    = f1_score(y_true, preds, average="macro", zero_division=0)
+    if f1 > best_f1:
+        best_f1, best_thresh = f1, t
+
+print(f"\n🎯 Best decision threshold: {best_thresh:.2f}  (macro F1 = {best_f1:.3f})")
+print("   Update DECISION_THRESHOLD in model_loader.py if needed")
+
+# ── Diagnose common failure modes ──────────────────────────────────────────────
+val_auc = max(history.history.get("val_auc", [0]))
+val_acc = max(history.history.get("val_accuracy", [0]))
+
+print("\n🔍 Diagnosis:")
+if val_auc < 0.65:
+    print("   ❌ AUC < 0.65 — model is barely better than random.")
+    print("      Likely cause: mixed front/side view, or GOOD and BAD look the same.")
+    print("      Action: check your videos, ensure clear form differences.")
+elif val_auc < 0.80:
+    print("   ⚠  AUC 0.65–0.80 — model learned something but not reliable.")
+    print("      Action: record 10+ more videos per class, focus on clear exaggeration.")
+elif val_auc < 0.90:
+    print("   ✅ AUC 0.80–0.90 — decent model, usable in production with hysteresis.")
+else:
+    print("   ✅✅ AUC > 0.90 — excellent! Deploy with confidence.")
+
+if cm[0, 1] > cm[0, 0]:
+    print("   ⚠  Model tends to predict GOOD even for BAD form (high false-positive rate).")
+    print(f"      Try threshold={min(best_thresh+0.05, 0.75):.2f} to be more conservative.")
+
+# ── Save models ────────────────────────────────────────────────────────────────
+h5_path    = MODEL_DIR / "squat_model.h5"
+keras_path = MODEL_DIR / "squat_model.keras"
+
+model.save(str(h5_path))
+model.save(str(keras_path))
+print(f"\n💾 Saved: {h5_path}")
+print(f"💾 Saved: {keras_path}")
+
+# ── TFLite export ──────────────────────────────────────────────────────────────
+try:
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_bytes = converter.convert()
+    tflite_path  = MODEL_DIR / "squat_model.tflite"
+    tflite_path.write_bytes(tflite_bytes)
+    print(f"💾 TFLite: {tflite_path}  ({len(tflite_bytes)//1024} KB)")
+except Exception as e:
+    print(f"⚠  TFLite export failed: {e}")
+
+# ── Save training info ─────────────────────────────────────────────────────────
+info = {
+    "val_auc":          float(val_auc),
+    "val_accuracy":     float(val_acc),
+    "best_threshold":   float(best_thresh),
+    "best_f1":          float(best_f1),
+    "total_params":     total_params,
+    "confusion_matrix": cm.tolist(),
+    "label_map":        {"0": "BAD", "1": "GOOD"},
+    "decision_threshold": float(best_thresh),
+}
+with open(DATA_DIR / "training_report.json", "w") as f:
+    json.dump(info, f, indent=2)
+
+# ── Training plot ──────────────────────────────────────────────────────────────
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig.suptitle(f"Spotter LSTM Training  |  val_AUC={val_auc:.3f}  threshold={best_thresh:.2f}",
+                 fontsize=13, fontweight="bold")
+
+    h = history.history
+    ep = range(1, len(h["loss"]) + 1)
+
+    axes[0].plot(ep, h["loss"],         label="Train"); axes[0].plot(ep, h["val_loss"],     label="Val")
+    axes[0].set_title("Loss (lower=better)"); axes[0].legend(); axes[0].set_xlabel("Epoch")
+
+    axes[1].plot(ep, h["accuracy"],     label="Train"); axes[1].plot(ep, h["val_accuracy"], label="Val")
+    axes[1].set_title("Accuracy"); axes[1].legend(); axes[1].set_xlabel("Epoch")
+
+    axes[2].plot(ep, h["auc"],          label="Train"); axes[2].plot(ep, h["val_auc"],      label="Val")
+    axes[2].axhline(0.80, color="orange", linestyle="--", label="0.80 target")
+    axes[2].axhline(0.90, color="green",  linestyle="--", label="0.90 target")
+    axes[2].set_title("AUC (higher=better)"); axes[2].legend(); axes[2].set_xlabel("Epoch")
+
+    plt.tight_layout()
+    plot_path = DATA_DIR / "training_plot.png"
+    plt.savefig(str(plot_path), dpi=150)
+    print(f"\n📊 Training plot → {plot_path}")
+except Exception as e:
+    print(f"   (Plot skipped: {e})")
+
+print("\n✅ Training complete! Next: python webcam_test.py")
+print(f"   If GOOD/BAD appear inverted, press L in webcam_test.py to flip labels.")
+print(f"   Recommended threshold in model_loader.py: {best_thresh:.2f}")

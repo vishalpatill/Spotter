@@ -25,7 +25,7 @@ def _build_squat_model():
         LSTM(32),
         Dropout(0.2),
         Dense(16, activation="relu"),
-        Dense(2, activation="softmax"),
+        Dense(1, activation="sigmoid"),
     ])
 
 
@@ -60,7 +60,11 @@ def predict_sequence(sequence):
 
     prediction = get_model().predict(sequence, verbose=0)[0]
 
-    label = int(np.argmax(prediction))
-    confidence = float(np.max(prediction))
+    prob = float(prediction[0])
+
+    threshold = 0.48  # from your training
+
+    label = 1 if prob > threshold else 0
+    confidence = prob if label == 1 else (1 - prob)
 
     return label, confidence

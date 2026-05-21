@@ -1,10 +1,40 @@
+# Virtual Environment
 venv/
+
+# Python Cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
+# Environment Variables
+.env
+
+# Raw datasets
 data/raw/
+
+# Videos
 *.mp4
 
-.env
+# NumPy training arrays
+*.npy
+
+# Training outputs
+training_plot.png
+training_report.json
+
+# Logs
+*.log
+sort_log.json
+
+# Screenshots
+screenshot_*.jpg
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# TensorFlow checkpoints
+*.ckpt
