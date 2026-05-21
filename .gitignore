@@ -38,3 +38,6 @@ screenshot_*.jpg
 
 # TensorFlow checkpoints
 *.ckpt
+node_modules/
+dist/
+.env
